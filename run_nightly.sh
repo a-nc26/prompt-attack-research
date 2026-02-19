@@ -36,6 +36,36 @@ if [ $? -ne 0 ]; then
     echo "[$(date)] ERROR: build_dashboard.py failed" >> "$LOG"
 fi
 
+echo "[$(date)] Step 4/4 — Pushing dashboard to GitHub Pages..." >> "$LOG"
+
+PAGES_REPO="$HOME/ai_security_research/.pages_repo"
+
+# Clone public dashboard repo if not already present
+if [ ! -d "$PAGES_REPO/.git" ]; then
+    git clone https://github.com/a-nc26/prompt-attack-taxonomy.git "$PAGES_REPO" >> "$LOG" 2>&1
+fi
+
+# Copy latest dashboard as index.html
+cp ~/Desktop/prompt_attack_taxonomy.html "$PAGES_REPO/index.html"
+
+# Commit and push
+cd "$PAGES_REPO"
+git add index.html
+git commit -m "Dashboard update: $DATE nightly run" >> "$LOG" 2>&1
+git push origin main >> "$LOG" 2>&1
+
+if [ $? -eq 0 ]; then
+    echo "[$(date)] Dashboard pushed to: https://a-nc26.github.io/prompt-attack-taxonomy/" >> "$LOG"
+else
+    echo "[$(date)] ERROR: GitHub Pages push failed" >> "$LOG"
+fi
+
+# Also commit updated master_db to private research repo
+cd ~/ai_security_research
+git add data/master_db.json data/master_db_v2.json
+git commit -m "Data update: $DATE nightly run" >> "$LOG" 2>&1
+git push origin main >> "$LOG" 2>&1
+
 echo "[$(date)] Nightly run complete" >> "$LOG"
-echo "[$(date)] Dashboard: ~/Desktop/prompt_attack_taxonomy.html" >> "$LOG"
+echo "[$(date)] Live dashboard: https://a-nc26.github.io/prompt-attack-taxonomy/" >> "$LOG"
 echo "[$(date)] Log: $LOG" >> "$LOG"
