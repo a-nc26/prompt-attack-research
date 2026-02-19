@@ -314,7 +314,7 @@ def make_entry(
         "taxonomy_category": taxonomy_category,
         "technique_name": taxonomy_category,
         "technique_description": f"Entry from {source_dataset} dataset.",
-        "example_prompt": selftext[:600] if relevant else None,
+        "example_prompt": selftext[:5000] if relevant else None,
         "persona_role": None,
         "severity": severity,
         "has_actual_prompt": has_prompt,

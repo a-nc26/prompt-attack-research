@@ -400,11 +400,20 @@ def build_html(all_posts: list) -> str:
   .prompt-block {{
     background: #0d1117; color: #39d353;
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-    padding: 8px; border-radius: 4px; font-size: 0.8em;
-    max-height: 120px; overflow-y: auto; white-space: pre-wrap;
+    padding: 10px; border-radius: 4px; font-size: 0.78em;
+    max-height: 200px; overflow-y: auto; white-space: pre-wrap;
     border: 1px solid #2d3149; word-break: break-word;
-    margin-top: 2px;
+    margin-top: 2px; transition: max-height 0.2s ease;
   }}
+  .prompt-block.expanded {{
+    max-height: none;
+    overflow-y: visible;
+  }}
+  .prompt-toggle {{
+    display: inline-block; margin-top: 4px; font-size: 10px;
+    color: #39d353; cursor: pointer; opacity: 0.75; user-select: none;
+  }}
+  .prompt-toggle:hover {{ opacity: 1; text-decoration: underline; }}
   .no-prompt {{ color: #555; font-size: 11px; font-style: italic; }}
 
   /* SOURCE */
@@ -644,7 +653,21 @@ function renderRow(p) {{
   // Col 6: Example prompt — terminal code block if has_actual_prompt
   let promptHtml;
   if (p.has_actual_prompt && p.example_prompt) {{
-    promptHtml = '<div class="prompt-block">' + escHtml(p.example_prompt) + '</div>';
+    const uid = 'pb_' + Math.random().toString(36).slice(2, 9);
+    promptHtml = '<div class="prompt-block" id="' + uid + '">'
+               + escHtml(p.example_prompt)
+               + '</div>'
+               + '<span class="prompt-toggle" onclick="(function(){{' +
+                   'var b=document.getElementById(\'' + uid + '\');' +
+                   'var t=this;' +
+                   'if(b.classList.contains(\'expanded\')){{'  +
+                     'b.classList.remove(\'expanded\');' +
+                     't.textContent=\'Show more\';' +
+                   '}}else{{'  +
+                     'b.classList.add(\'expanded\');' +
+                     't.textContent=\'Show less\';' +
+                   '}}' +
+               '}}).call(this)">Show more</span>';
   }} else {{
     promptHtml = '<span style="color:#555">\u2014 no prompt extracted \u2014</span>';
   }}

@@ -15,6 +15,70 @@ import re
 import sys
 from collections import Counter
 
+# ---------------------------------------------------------------------------
+# Prompt extraction (mirrors classify_posts.py logic, 5000 char limit)
+# ---------------------------------------------------------------------------
+
+def extract_prompt(selftext: str):
+    """
+    Extract the most representative prompt text from selftext.
+    Returns a string (up to 5000 chars) or None.
+
+    Hierarchy:
+      1. Code blocks (```)
+      2. Blockquotes (lines starting with >)
+      3. After prompt labels (Prompt:, Template:, System:, etc.)
+      4. Post body IS the prompt (starts with prompt-like text)
+    """
+    if not selftext:
+        return None
+
+    # 1. Code blocks
+    code_blocks = re.findall(r'```(?:\w+\n)?(.*?)```', selftext, re.DOTALL)
+    if code_blocks:
+        longest = max(code_blocks, key=len).strip()
+        if len(longest) > 20:
+            return longest[:5000]
+
+    # 2. Blockquotes
+    quote_lines = [l[1:].strip() for l in selftext.split('\n') if l.startswith('>')]
+    if quote_lines and len(' '.join(quote_lines)) > 30:
+        return ' '.join(quote_lines)[:5000]
+
+    # 3. After prompt labels
+    for label in ['Prompt:', 'Template:', 'System:', 'Try this:', 'Copy this:', 'Instruction:']:
+        if label.lower() in selftext.lower():
+            idx = selftext.lower().index(label.lower()) + len(label)
+            snippet = selftext[idx:idx + 5000].strip()
+            if len(snippet) > 20:
+                return snippet
+
+    # 4. Post body IS the prompt (starts with prompt-like text)
+    stripped = selftext.strip()
+    prompt_starters = ['you are ', 'act as ', 'ignore ', 'forget ', '[system]', 'i want you to']
+    if any(stripped.lower().startswith(s) for s in prompt_starters):
+        return stripped[:5000]
+
+    return None
+
+
+def _looks_truncated(prompt: str) -> bool:
+    """
+    Return True if the prompt appears to be cut off mid-word or mid-sentence
+    (i.e., ends without terminal punctuation and last char is alphanumeric or a comma).
+    """
+    if not prompt:
+        return False
+    stripped = prompt.rstrip()
+    if not stripped:
+        return False
+    last_char = stripped[-1]
+    # Ends properly if it has a terminal punctuation mark
+    if last_char in '.!?"\')]}':
+        return False
+    # Looks truncated if it ends with a word character or comma
+    return bool(re.search(r'[\w,]$', stripped))
+
 DATA_DIR        = os.path.expanduser("~/ai_security_research/data")
 MASTER_DB_PATH  = os.path.join(DATA_DIR, "master_db.json")
 
@@ -481,6 +545,8 @@ def main():
     kept_count      = 0
     excluded_count  = 0
 
+    reextracted_count = 0
+
     for entry in db:
         selftext    = entry.get("selftext", "") or ""
         was_relevant = bool(entry.get("relevant"))
@@ -494,6 +560,24 @@ def main():
             new_cat = classify_taxonomy(selftext)
             entry["taxonomy_category"] = new_cat
             entry["severity"]          = classify_severity(new_cat, selftext)
+
+            # Re-extract example_prompt if it is not null but looks truncated,
+            # OR if it is null (try a fresh extraction).
+            existing_prompt = entry.get("example_prompt")
+            if existing_prompt is None or _looks_truncated(existing_prompt):
+                new_prompt = extract_prompt(selftext)
+                if new_prompt:
+                    entry["example_prompt"]    = new_prompt
+                    entry["has_actual_prompt"] = True
+                    reextracted_count += 1
+            else:
+                # Already have a prompt; ensure it is not capped at the old 600-char limit.
+                # If selftext can yield a longer version, re-extract.
+                if len(existing_prompt) >= 590:
+                    new_prompt = extract_prompt(selftext)
+                    if new_prompt and len(new_prompt) > len(existing_prompt):
+                        entry["example_prompt"] = new_prompt
+                        reextracted_count += 1
 
             kept_count += 1
             if len(correctly_kept) < 3:
@@ -518,6 +602,7 @@ def main():
     print(f"  Total entries (unchanged):  {total_before:,}")
     print(f"  Relevant after filtering:   {kept_count:,}")
     print(f"  Excluded after filtering:   {excluded_count:,}")
+    print(f"  Prompts re-extracted:       {reextracted_count:,}")
     print(f"  DB file size:               {size_bytes:,} bytes ({size_bytes / 1024 / 1024:.1f} MB)")
     print()
 

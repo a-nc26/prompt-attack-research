@@ -285,7 +285,7 @@ def classify_taxonomy(title: str, selftext: str) -> dict:
 def extract_prompt(selftext: str):
     """
     STAGE 3: Extract the most representative prompt text from selftext.
-    Returns a string (up to 600 chars) or None.
+    Returns a string (up to 5000 chars) or None.
 
     Hierarchy:
       1. Code blocks (```)
@@ -301,18 +301,18 @@ def extract_prompt(selftext: str):
     if code_blocks:
         longest = max(code_blocks, key=len).strip()
         if len(longest) > 20:
-            return longest[:600]
+            return longest[:5000]
 
     # 2. Blockquotes
     quote_lines = [l[1:].strip() for l in selftext.split('\n') if l.startswith('>')]
     if quote_lines and len(' '.join(quote_lines)) > 30:
-        return ' '.join(quote_lines)[:600]
+        return ' '.join(quote_lines)[:5000]
 
     # 3. After prompt labels
     for label in ['Prompt:', 'Template:', 'System:', 'Try this:', 'Copy this:', 'Instruction:']:
         if label.lower() in selftext.lower():
             idx = selftext.lower().index(label.lower()) + len(label)
-            snippet = selftext[idx:idx + 600].strip()
+            snippet = selftext[idx:idx + 5000].strip()
             if len(snippet) > 20:
                 return snippet
 
@@ -320,7 +320,7 @@ def extract_prompt(selftext: str):
     stripped = selftext.strip()
     prompt_starters = ['you are ', 'act as ', 'ignore ', 'forget ', '[system]', 'i want you to']
     if any(stripped.lower().startswith(s) for s in prompt_starters):
-        return stripped[:600]
+        return stripped[:5000]
 
     return None
 
