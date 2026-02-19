@@ -15,12 +15,174 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 import warnings
 from datetime import datetime, timezone
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Strict adversarial relevance gate
+# ---------------------------------------------------------------------------
+# This gate must be applied to every entry BEFORE adding it to the DB.
+# It mirrors the logic in refilter_db.py exactly so that future ingestion
+# runs do not re-introduce SEO/marketing/benign noise.
+
+_JAILBREAK_PHRASES = [
+    "ignore previous instructions", "ignore all previous", "you are now",
+    "act as if you have no", "you have no restrictions", "forget your training",
+    "disregard your", "override your", "pretend you have no", "dan",
+    "do anything now", "developer mode", "jailbreak mode", "unrestricted mode",
+]
+
+_PERSONA_INJECTION_RE = re.compile(
+    r"act as\s+(an?\s+)?(AI|assistant|model|GPT|Claude|LLM|bot|expert|hacker|evil|uncensored|unfiltered|unaligned)",
+    re.IGNORECASE,
+)
+
+_SYSTEM_OVERRIDE_PHRASES = [
+    "[system]", "[inst]", "### system:", "<<sys>>", "system prompt:",
+    "ignore your previous", "new persona:", "you are an ai that",
+]
+
+_ENCODING_TRICK_RE = re.compile(
+    r"(base64|rot13|leetspeak|pig latin|morse code).{0,80}(encode|decode|prompt)",
+    re.IGNORECASE | re.DOTALL,
+)
+_ENCODING_DIRECT = ["base64", "rot13", "leetspeak", "pig latin"]
+
+_EXTRACTION_PHRASES = [
+    "repeat your instructions", "what is your system prompt",
+    "reveal your instructions", "print your prompt",
+    "output your system", "leak your",
+]
+
+_MULTI_TURN_PHRASES = [
+    "crescendo", "gradually escalate", "each turn", "build up to",
+]
+
+_INJECTION_PHRASES = [
+    "prompt injection", "indirect injection",
+    "ignore the above", "ignore above instructions",
+]
+
+_RESEARCH_PHRASES = [
+    "red team", "red-team", "adversarial prompt", "jailbreak technique",
+    "safety bypass", "guardrail bypass", "prompt attack",
+    "llm vulnerability", "jailbreak evaluation", "attack success rate",
+]
+
+_SEO_MARKETING_PHRASES = [
+    "seo", "meta title", "meta description", "keyword research", "outrank",
+    "targetlanguage", "promptpackage", "prompthint", "redbubble", "etsy",
+    "ecommerce", "e-commerce", "product description",
+    "click-through rate", "conversion rate",
+]
+
+_PLATFORM_NOISE_PHRASES = [
+    "or is down", "app not working", "server error", "can't login", "cannot login",
+]
+
+_BENIGN_START_RE = re.compile(
+    r"^(Write a|Create a|Generate a|Summarize|Translate)\s",
+    re.IGNORECASE,
+)
+
+_ADVERSARIAL_RESCUE_PHRASES = [
+    "ignore previous instructions", "ignore all previous", "you are now",
+    "act as if you have no", "you have no restrictions", "forget your training",
+    "disregard your", "override your", "pretend you have no", "dan",
+    "do anything now", "developer mode", "jailbreak mode", "unrestricted mode",
+    "base64", "rot13", "leetspeak", "repeat your instructions",
+    "what is your system prompt", "reveal your instructions",
+    "print your prompt", "output your system", "leak your",
+    "crescendo", "gradually escalate", "prompt injection",
+    "indirect injection", "ignore the above", "ignore above instructions",
+    "red team", "red-team", "adversarial prompt", "jailbreak technique",
+    "safety bypass", "guardrail bypass", "[system]", "[inst]",
+    "### system:", "<<sys>>", "system prompt:", "new persona:", "you are an ai that",
+]
+
+
+def is_adversarial(selftext: str) -> bool:
+    """
+    Returns True iff selftext contains genuine adversarial content.
+
+    Apply this gate to every entry before adding it to master_db so that
+    SEO templates, marketing copy, and benign prompts are never ingested.
+
+    Hard EXCLUDE signals are checked first and override all KEEP signals.
+    """
+    if not selftext or not isinstance(selftext, str):
+        return False
+
+    text = selftext.strip()
+    low  = text.lower()
+
+    # ---- HARD EXCLUDE ----
+    if len(text) < 50:
+        return False
+
+    if any(p in low for p in _SEO_MARKETING_PHRASES):
+        return False
+
+    placeholder_count = (
+        low.count("[prompt]")
+        + low.count("[target]")
+        + sum(1 for _ in re.finditer(r"\[variable", low))
+    )
+    if placeholder_count >= 3:
+        if not (any(p in low for p in _ADVERSARIAL_RESCUE_PHRASES)
+                or _PERSONA_INJECTION_RE.search(text)):
+            return False
+
+    if any(p in low for p in _PLATFORM_NOISE_PHRASES):
+        return False
+
+    # Auto-generated classifier descriptions that are NOT real prompts
+    _AUTO_DESCRIPTION_SIGNALS = [
+        "unrelated to adversarial prompting",
+        "not focused on adversarial prompting",
+        "platform discussion covering",
+        "platform technical support",
+        "not an adversarial",
+        "ai-generated tabletop",
+        "agi timeline commentary",
+        "general prompt engineering technique",
+    ]
+    if any(sig in low for sig in _AUTO_DESCRIPTION_SIGNALS):
+        return False
+
+    if _BENIGN_START_RE.match(text):
+        if not (any(p in low for p in _ADVERSARIAL_RESCUE_PHRASES)
+                or _PERSONA_INJECTION_RE.search(text)):
+            return False
+
+    # ---- HARD KEEP ----
+    if any(p in low for p in _JAILBREAK_PHRASES):
+        return True
+    if _PERSONA_INJECTION_RE.search(text):
+        return True
+    if any(p in low for p in _SYSTEM_OVERRIDE_PHRASES):
+        return True
+    if _ENCODING_TRICK_RE.search(text):
+        return True
+    for kw in _ENCODING_DIRECT:
+        if kw in low and ("encode" in low or "decode" in low or "prompt" in low):
+            return True
+    if any(p in low for p in _EXTRACTION_PHRASES):
+        return True
+    if any(p in low for p in _MULTI_TURN_PHRASES):
+        return True
+    if any(p in low for p in _INJECTION_PHRASES):
+        return True
+    if any(p in low for p in _RESEARCH_PHRASES):
+        return True
+
+    return False
 
 # ---------------------------------------------------------------------------
 # Dependency checks
@@ -842,6 +1004,18 @@ def main():
             h = entry.get("id", "")
             st = entry.get("selftext", "")
             st_hash = content_hash(st) if st else ""
+
+            # ---- STRICT ADVERSARIAL GATE ----
+            # Apply the same gate used in refilter_db.py to every incoming
+            # entry so that SEO templates, marketing copy, and benign prompts
+            # are never added to the DB on future ingestion runs.
+            if not is_adversarial(st):
+                entry["relevant"] = False
+                # Still add to DB (for completeness) but mark as non-relevant
+                # so the dashboard filters it out.
+            else:
+                entry["relevant"] = True
+
             # Dedup check: id OR selftext hash already in existing_hashes
             if h in existing_hashes or st_hash in existing_hashes:
                 skipped += 1

@@ -61,7 +61,7 @@ SEVERITY_COLORS = {
 # ---------------------------------------------------------------------------
 
 def load_db():
-    path = V2_PATH if os.path.exists(V2_PATH) else V1_PATH
+    path = V1_PATH  # master_db.json is canonical (contains all datasets + Reddit)
     if not os.path.exists(path):
         print(f"WARN: No database found. Generating empty dashboard.", file=sys.stderr)
         return []
@@ -234,7 +234,7 @@ def build_html(all_posts: list) -> str:
   /* LAYOUT */
   .layout {{
     display: flex;
-    height: calc(100vh - 152px);
+    height: calc(100vh - 192px);
     min-height: 500px;
   }}
 
@@ -426,6 +426,38 @@ def build_html(all_posts: list) -> str:
   /* NO RESULTS */
   .no-results {{ padding: 60px; text-align: center; color: var(--muted); }}
 
+  /* PAGINATION */
+  .pagination {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 8px 14px;
+    background: var(--card2);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }}
+  .page-btn {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 4px 14px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.12s;
+    white-space: nowrap;
+  }}
+  .page-btn:hover:not(:disabled) {{ background: var(--accent); border-color: var(--accent); color: #fff; }}
+  .page-btn:disabled {{ opacity: 0.35; cursor: not-allowed; }}
+  .page-indicator {{
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+    min-width: 90px;
+    text-align: center;
+  }}
+
   /* SCROLLBAR */
   ::-webkit-scrollbar {{ width: 5px; height: 5px; }}
   ::-webkit-scrollbar-track {{ background: transparent; }}
@@ -437,7 +469,7 @@ def build_html(all_posts: list) -> str:
 
 <div class="header">
   <h1>AI Prompt Attack Taxonomy Dashboard</h1>
-  <p>Precision-classified AI jailbreak &amp; prompt injection techniques from Reddit &mdash; relevant posts only</p>
+  <p>Precision-classified AI jailbreak &amp; prompt injection techniques &mdash; relevant posts only &middot; 100 rows/page</p>
 </div>
 
 <!-- TOP STATS BAR: 5 cards -->
@@ -521,6 +553,13 @@ def build_html(all_posts: list) -> str:
       <div class="no-results" id="noResults" style="display:none">No entries match the current filters.</div>
     </div>
 
+    <!-- PAGINATION -->
+    <div class="pagination" id="paginationBar">
+      <button class="page-btn" id="prevBtn" onclick="changePage(-1)" disabled>&#8592; Previous</button>
+      <span class="page-indicator" id="pageIndicator">Page 1 of 1</span>
+      <button class="page-btn" id="nextBtn" onclick="changePage(1)" disabled>Next &#8594;</button>
+    </div>
+
   </div>
 </div>
 
@@ -531,10 +570,13 @@ const CAT_COLORS = {js_cat_colors};
 const SEV_COLORS = {js_sev_colors};
 const SEV_ORDER  = {{High:0,Medium:1,Low:2,Info:3}};
 
-let sortCol        = 'severity';
-let sortDir        = 'asc';
-let activeCategory = null;  // null = All
+const PAGE_SIZE = 100;
+
+let sortCol           = 'severity';
+let sortDir           = 'asc';
+let activeCategory    = null;   // null = All
 let showHasPromptOnly = false;
+let currentPage       = 1;      // 1-based
 
 // ---- Sidebar click handler (uses data-cat, not encoded onclick args) ----
 document.getElementById('sidebarItems').addEventListener('click', function(e) {{
@@ -545,6 +587,7 @@ document.getElementById('sidebarItems').addEventListener('click', function(e) {{
   document.querySelectorAll('.sidebar-item').forEach(function(el) {{
     el.classList.toggle('active', el.dataset.cat === (activeCategory === null ? '' : activeCategory));
   }});
+  currentPage = 1;
   applyFilters();
 }});
 
@@ -592,14 +635,13 @@ function renderRow(p) {{
 
   // Col 5: Technique description (2 sentences max, no expand)
   const desc = (p.technique_description || '').trim();
-  // Extract up to 2 sentences
   const sentences = desc.match(/[^.!?]*[.!?]/g) || [];
   const shortDesc = sentences.length >= 2
     ? sentences.slice(0, 2).join(' ').trim()
     : desc;
   const descHtml = '<div class="tech-desc">' + escHtml(shortDesc) + '</div>';
 
-  // Col 6: Example prompt — terminal code block if has_actual_prompt, else "— no prompt extracted —"
+  // Col 6: Example prompt — terminal code block if has_actual_prompt
   let promptHtml;
   if (p.has_actual_prompt && p.example_prompt) {{
     promptHtml = '<div class="prompt-block">' + escHtml(p.example_prompt) + '</div>';
@@ -636,15 +678,10 @@ function getFiltered() {{
   const sevF   = document.getElementById('sevFilter').value;
 
   return DATA.filter(function(p) {{
-    // Sidebar category
     if (activeCategory !== null && p.taxonomy_category !== activeCategory) return false;
-    // Dropdown category
     if (catF && p.taxonomy_category !== catF) return false;
-    // Severity
     if (sevF && p.severity !== sevF) return false;
-    // Has Prompt toggle
     if (showHasPromptOnly && p.has_actual_prompt !== true) return false;
-    // Search (technique_name, example_prompt, technique_description, title)
     if (search) {{
       const hay = [
         p.technique_name        || '',
@@ -664,7 +701,6 @@ function getSorted(data) {{
   return data.slice().sort(function(a, b) {{
     var av = a[sortCol];
     var bv = b[sortCol];
-    // Null/undefined always sort last
     if (av == null && bv == null) return 0;
     if (av == null) return 1;
     if (bv == null) return -1;
@@ -680,20 +716,57 @@ function getSorted(data) {{
   }});
 }}
 
-function applyFilters() {{
-  const filtered = getSorted(getFiltered());
+function updatePagination(totalFiltered) {{
+  const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
+  if (currentPage > totalPages) currentPage = totalPages;
+  if (currentPage < 1) currentPage = 1;
+
+  document.getElementById('pageIndicator').textContent =
+    'Page ' + currentPage + ' of ' + totalPages;
+  document.getElementById('prevBtn').disabled = (currentPage <= 1);
+  document.getElementById('nextBtn').disabled = (currentPage >= totalPages);
+}}
+
+function changePage(delta) {{
+  currentPage += delta;
+  // Re-render with new page (filters unchanged)
+  renderCurrentPage(lastFilteredData);
+  // Scroll table back to top
+  const wrap = document.getElementById('tableWrap');
+  if (wrap) wrap.scrollTop = 0;
+}}
+
+// Store last filtered+sorted data so changePage() can use it without re-filtering
+let lastFilteredData = [];
+
+function renderCurrentPage(filtered) {{
+  lastFilteredData = filtered;
   const tbody = document.getElementById('tableBody');
   const noRes = document.getElementById('noResults');
+
+  updatePagination(filtered.length);
 
   if (filtered.length === 0) {{
     tbody.innerHTML = '';
     noRes.style.display = 'block';
   }} else {{
     noRes.style.display = 'none';
-    tbody.innerHTML = filtered.map(renderRow).join('');
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const end   = Math.min(start + PAGE_SIZE, filtered.length);
+    const pageRows = filtered.slice(start, end);
+    tbody.innerHTML = pageRows.map(renderRow).join('');
   }}
+
+  const showing = filtered.length === 0 ? 0
+    : Math.min(PAGE_SIZE, filtered.length - (currentPage - 1) * PAGE_SIZE);
   document.getElementById('resultCount').textContent =
-    'Showing ' + filtered.length + ' / ' + DATA.length;
+    'Showing ' + showing + ' of ' + filtered.length + ' matched / ' + DATA.length + ' total';
+}}
+
+function applyFilters() {{
+  currentPage = 1;
+  const filtered = getSorted(getFiltered());
+  renderCurrentPage(filtered);
 }}
 
 function sortTable(col) {{
@@ -723,6 +796,7 @@ function clearAllFilters() {{
   document.getElementById('sevFilter').value = '';
   activeCategory = null;
   showHasPromptOnly = false;
+  currentPage = 1;
   document.getElementById('promptToggleBtn').textContent = 'Has Prompt';
   document.getElementById('promptToggleBtn').classList.remove('prompt-active');
   document.querySelectorAll('.sidebar-item').forEach(function(el) {{
