@@ -8,6 +8,7 @@
 #   0 2 * * * bash ~/ai_security_research/run_nightly.sh
 
 DATE=$(date +%Y%m%d)
+DOW=$(date +%u)   # 1=Monday, 7=Sunday (ISO weekday)
 LOG_DIR="$HOME/ai_security_research/logs"
 LOG="$LOG_DIR/nightly_$DATE.log"
 
@@ -15,21 +16,32 @@ mkdir -p "$LOG_DIR"
 
 echo "[$(date)] Starting nightly run" >> "$LOG"
 
-echo "[$(date)] Step 1/3 — Fetching Reddit posts..." >> "$LOG"
+# Step 0: On Mondays only, fetch Tier 1 academic datasets
+if [ "$DOW" -eq 1 ]; then
+    echo "[$(date)] Step 0/4 — Monday: Fetching Tier 1 academic datasets..." >> "$LOG"
+    python3 ~/ai_security_research/fetch_datasets.py >> "$LOG" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "[$(date)] ERROR: fetch_datasets.py failed" >> "$LOG"
+    fi
+else
+    echo "[$(date)] Step 0/4 — Skipping dataset fetch (runs on Mondays only, today DOW=$DOW)" >> "$LOG"
+fi
+
+echo "[$(date)] Step 1/4 — Fetching Reddit posts..." >> "$LOG"
 bash ~/ai_security_research/fetch_reddit.sh >> "$LOG" 2>&1
 
 if [ $? -ne 0 ]; then
     echo "[$(date)] ERROR: fetch_reddit.sh failed" >> "$LOG"
 fi
 
-echo "[$(date)] Step 2/3 — Classifying posts..." >> "$LOG"
+echo "[$(date)] Step 2/4 — Classifying posts..." >> "$LOG"
 python3 ~/ai_security_research/classify_posts.py /tmp/reddit_posts_raw_$DATE.json >> "$LOG" 2>&1
 
 if [ $? -ne 0 ]; then
     echo "[$(date)] ERROR: classify_posts.py failed" >> "$LOG"
 fi
 
-echo "[$(date)] Step 3/3 — Building dashboard..." >> "$LOG"
+echo "[$(date)] Step 3/4 — Building dashboard..." >> "$LOG"
 python3 ~/ai_security_research/build_dashboard.py >> "$LOG" 2>&1
 
 if [ $? -ne 0 ]; then
