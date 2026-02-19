@@ -4,7 +4,7 @@
 # Outputs: /tmp/reddit_posts_raw_YYYYMMDD.json
 # Logs to: ~/ai_security_research/logs/fetch_YYYYMMDD.log
 
-USER_AGENT="AISecurityResearch/1.0"
+USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 DATE=$(date +%Y%m%d)
 OUTPUT_FILE="/tmp/reddit_posts_raw_${DATE}.json"
 LOG_DIR="$HOME/ai_security_research/logs"
@@ -53,27 +53,28 @@ echo "[]" > "$TEMP_COMBINED"
 for sub in "${SUBREDDITS[@]}"; do
     log "Fetching r/$sub ..."
 
-    RESPONSE=$(curl -s -w "\n%{http_code}" \
+    TEMP_RESPONSE="/tmp/reddit_response_$$.json"
+    HTTP_CODE=$(curl -s -o "$TEMP_RESPONSE" -w "%{http_code}" \
         -H "User-Agent: $USER_AGENT" \
         "https://www.reddit.com/r/${sub}/new.json?limit=50")
 
-    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-    BODY=$(echo "$RESPONSE" | head -n -1)
-
     if [ "$HTTP_CODE" = "404" ]; then
         log "SKIP r/$sub — 404 Not Found (subreddit may not exist)"
+        rm -f "$TEMP_RESPONSE"
         sleep 2
         continue
     fi
 
     if [ "$HTTP_CODE" = "403" ]; then
         log "SKIP r/$sub — 403 Forbidden (private or banned)"
+        rm -f "$TEMP_RESPONSE"
         sleep 2
         continue
     fi
 
     if [ "$HTTP_CODE" != "200" ]; then
         log "SKIP r/$sub — HTTP $HTTP_CODE unexpected response"
+        rm -f "$TEMP_RESPONSE"
         sleep 2
         continue
     fi
@@ -84,7 +85,9 @@ import json, sys
 
 cutoff = $CUTOFF_UTC
 subreddit = "$sub"
-body = '''$BODY'''
+
+with open("$TEMP_RESPONSE", "r", encoding="utf-8", errors="replace") as f:
+    body = f.read()
 
 try:
     data = json.loads(body)
@@ -127,6 +130,8 @@ with open("$TEMP_COMBINED", "w") as f:
 
 print(f"  r/{subreddit}: {len(filtered)} posts within last 24h (of {len(posts_data)} fetched)")
 PYEOF
+
+    rm -f "$TEMP_RESPONSE"
 
     COUNT=$(python3 -c "
 import json
