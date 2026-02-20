@@ -13,6 +13,7 @@ Usage:
     python3 build_dashboard.py
 """
 
+import base64
 import json
 import os
 import sys
@@ -162,7 +163,8 @@ def build_html(all_posts: list) -> str:
             "example_prompt":       p.get("example_prompt") or None,
         })
 
-    js_data        = json.dumps(js_rows, ensure_ascii=False)
+    js_data_json   = json.dumps(js_rows, ensure_ascii=True)
+    js_data_b64    = base64.b64encode(js_data_json.encode('utf-8')).decode('ascii')
     js_cat_colors  = json.dumps(CATEGORY_COLORS, ensure_ascii=False)
     js_sev_colors  = json.dumps(SEVERITY_COLORS, ensure_ascii=False)
 
@@ -574,7 +576,7 @@ def build_html(all_posts: list) -> str:
 
 <script>
 // DATA contains ONLY relevant=true posts (pre-filtered in Python)
-const DATA = {js_data};
+const DATA = JSON.parse(atob("{js_data_b64}"));
 const CAT_COLORS = {js_cat_colors};
 const SEV_COLORS = {js_sev_colors};
 const SEV_ORDER  = {{High:0,Medium:1,Low:2,Info:3}};
@@ -653,21 +655,9 @@ function renderRow(p) {{
   // Col 6: Example prompt — terminal code block if has_actual_prompt
   let promptHtml;
   if (p.has_actual_prompt && p.example_prompt) {{
-    const uid = 'pb_' + Math.random().toString(36).slice(2, 9);
-    promptHtml = '<div class="prompt-block" id="' + uid + '">'
+    promptHtml = '<div class="prompt-block">'
                + escHtml(p.example_prompt)
-               + '</div>'
-               + '<span class="prompt-toggle" onclick="(function(){{' +
-                   'var b=document.getElementById(\'' + uid + '\');' +
-                   'var t=this;' +
-                   'if(b.classList.contains(\'expanded\')){{'  +
-                     'b.classList.remove(\'expanded\');' +
-                     't.textContent=\'Show more\';' +
-                   '}}else{{'  +
-                     'b.classList.add(\'expanded\');' +
-                     't.textContent=\'Show less\';' +
-                   '}}' +
-               '}}).call(this)">Show more</span>';
+               + '</div>';
   }} else {{
     promptHtml = '<span style="color:#555">\u2014 no prompt extracted \u2014</span>';
   }}
@@ -869,18 +859,28 @@ def main():
     size_bytes = os.path.getsize(DESKTOP_OUTPUT)
     print(f"File size:            {size_bytes:,} bytes ({size_bytes / 1024:.1f} KB)")
 
-    # Verification: parse embedded DATA variable
+    # Verification: extract and decode the base64-encoded embedded DATA
     with open(DESKTOP_OUTPUT, encoding="utf-8") as f:
         content = f.read()
 
-    data_start = content.find('const DATA = ') + len('const DATA = ')
-    data_end   = content.find('\nconst CAT_COLORS', data_start)
-    data_str   = content[data_start:data_end].rstrip().rstrip(';')
+    marker = 'const DATA = JSON.parse(atob("'
+    data_start = content.find(marker) + len(marker)
+    data_end   = content.find('"));', data_start)
+    b64_str    = content[data_start:data_end]
+
+    # Confirm </script> does not appear inside the data section
+    script_close_marker = '</script>'
+    data_section = content[content.find(marker):data_end]
+    if script_close_marker in data_section:
+        print(f"ERROR: '</script>' found inside the data section!", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"  '</script>' NOT found inside data section: OK")
 
     try:
-        embedded = json.loads(data_str)
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Embedded DATA is not valid JSON: {e}", file=sys.stderr)
+        embedded = json.loads(base64.b64decode(b64_str).decode('utf-8'))
+    except Exception as e:
+        print(f"ERROR: Failed to decode embedded DATA: {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"\nVerification:")
