@@ -566,7 +566,10 @@ def main():
             existing_prompt = entry.get("example_prompt")
             if existing_prompt is None or _looks_truncated(existing_prompt):
                 new_prompt = extract_prompt(selftext)
-                if new_prompt:
+                # If structured extraction found nothing, fall back to raw selftext[:5000]
+                if not new_prompt and selftext:
+                    new_prompt = selftext.strip()[:5000]
+                if new_prompt and (existing_prompt is None or len(new_prompt) > len(existing_prompt)):
                     entry["example_prompt"]    = new_prompt
                     entry["has_actual_prompt"] = True
                     reextracted_count += 1
@@ -575,6 +578,9 @@ def main():
                 # If selftext can yield a longer version, re-extract.
                 if len(existing_prompt) >= 590:
                     new_prompt = extract_prompt(selftext)
+                    # Fallback: use raw selftext if structured extraction yields nothing
+                    if not new_prompt and selftext:
+                        new_prompt = selftext.strip()[:5000]
                     if new_prompt and len(new_prompt) > len(existing_prompt):
                         entry["example_prompt"] = new_prompt
                         reextracted_count += 1
