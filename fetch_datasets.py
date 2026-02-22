@@ -297,14 +297,23 @@ def make_entry(
     has_prompt = bool(selftext)
     severity = infer_severity(has_prompt, taxonomy_category, relevant)
 
+    # Clean permalink: resolve/main/... → dataset page, raw.githubusercontent → repo page
+    clean_link = permalink
+    m_hf = re.match(r'(https://huggingface\.co/datasets/[^/]+/[^/]+)/resolve/.*', permalink)
+    if m_hf:
+        clean_link = m_hf.group(1)
+    m_gh = re.match(r'https://raw\.githubusercontent\.com/([^/]+/[^/]+)/.*', permalink)
+    if m_gh:
+        clean_link = 'https://github.com/' + m_gh.group(1)
+
     return {
         "id": h,
         "title": title[:80],
         "selftext": selftext,
         "author": author or source_dataset,
         "subreddit": subreddit,
-        "permalink": permalink,
-        "url": permalink,
+        "permalink": clean_link,
+        "url": clean_link,
         "score": 0,
         "num_comments": 0,
         "created_utc": 0,
