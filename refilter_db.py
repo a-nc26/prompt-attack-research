@@ -5,6 +5,12 @@ refilter_db.py
 Re-applies a strict adversarial relevance gate to ALL entries in master_db.json,
 re-classifies taxonomy, severity, and rebuilds the database in place.
 
+Classifier v3 rules:
+  Rule 1: Exclude ALL benign "act as" prompts (only keep adversarial ones)
+  Rule 2: has_actual_prompt = True ONLY for literal copy-paste prompts
+  Rule 3: Dedup by content hash only (no fuzzy matching)
+  Rule 4: Language detection on every entry
+
 Usage:
     python3 refilter_db.py
 """
@@ -82,8 +88,212 @@ def _looks_truncated(prompt: str) -> bool:
 DATA_DIR        = os.path.expanduser("~/ai_security_research/data")
 MASTER_DB_PATH  = os.path.join(DATA_DIR, "master_db.json")
 
+# ===========================================================================
+# RULE 1: Adversarial "act as" detection
+# ===========================================================================
+# An "act as" / "you are" / "pretend to be" prompt is ONLY adversarial if it
+# contains at least ONE of these adversarial signals.
+
+_ACT_AS_PATTERN = re.compile(
+    r'(act as|you are|pretend to be|pretend you are|imagine you are|roleplay as|respond as|reply as|answer as)',
+    re.IGNORECASE,
+)
+
+RESTRICTION_REMOVAL_SIGNALS = [
+    "no restrictions", "no limits", "no boundaries", "no guidelines",
+    "without restrictions", "without limits", "without filters",
+    "without guidelines", "bypass", "unrestricted", "unfiltered",
+    "uncensored", "unaligned", "no safety", "remove safety",
+    "disable safety", "safety off", "guardrails off", "no guardrails",
+]
+
+UNETHICAL_SIGNALS = [
+    "unethical", "amoral", "immoral", "no morals", "no ethics",
+    "evil", "harmful", "dangerous", "illegal", "malicious",
+    "nefarious", "sinister",
+]
+
+KNOWN_JAILBREAK_PERSONAS = [
+    "DAN", "STAN", "DUDE", "AIM", "JAILBREAK", "ENI", "LIME", "Neptune",
+    "Lyra", "MAX", "Developer Mode", "Sigma", "APOPHIS", "AntiGPT",
+    "BetterDAN", "KEVIN", "JailBreak", "BasedGPT", "UnGPT", "OMEGA",
+]
+
+# Pre-compile persona patterns for exact word match (case-insensitive)
+_PERSONA_WORD_PATTERNS = [
+    re.compile(r'\b' + re.escape(name) + r'\b', re.IGNORECASE)
+    for name in KNOWN_JAILBREAK_PERSONAS
+]
+
+INSTRUCTION_OVERRIDE_SIGNALS = [
+    "ignore previous", "ignore all", "forget your training",
+    "forget your instructions", "disregard your", "override your",
+    "new instructions", "supersede", "overwrite your programming",
+    "ignore your programming",
+]
+
+
+def is_adversarial_act_as(text: str) -> bool:
+    """
+    Rule 1: Return True if text contains an "act as" / "you are" / "pretend"
+    pattern AND at least one adversarial signal. Return False if the prompt
+    is benign (no adversarial signals).
+
+    If the text does NOT contain any act-as pattern at all, return None
+    (meaning this rule does not apply and other rules should decide).
+    """
+    if not text:
+        return None
+
+    if not _ACT_AS_PATTERN.search(text):
+        return None  # Not an act-as prompt; let other rules decide
+
+    low = text.lower()
+
+    # Check restriction removal signals
+    if any(sig in low for sig in RESTRICTION_REMOVAL_SIGNALS):
+        return True
+
+    # Check unethical/harmful signals
+    if any(sig in low for sig in UNETHICAL_SIGNALS):
+        return True
+
+    # Check known jailbreak persona names (exact word match)
+    for pat in _PERSONA_WORD_PATTERNS:
+        if pat.search(text):
+            return True
+
+    # Check instruction override signals
+    if any(sig in low for sig in INSTRUCTION_OVERRIDE_SIGNALS):
+        return True
+
+    # No adversarial signals found => benign act-as prompt
+    return False
+
+
+# ===========================================================================
+# RULE 2: Literal prompt detection
+# ===========================================================================
+
+def is_literal_prompt(text):
+    """
+    Return True only if text looks like a literal copy-paste prompt that you
+    could paste into ChatGPT/Claude. Discussions, blog posts, academic
+    descriptions, and questions are NOT literal prompts.
+    """
+    if not text or len(text) < 20:
+        return False
+    t = text.strip()
+    tl = t.lower()
+
+    # --- NOT a literal prompt: natural prose / discussion / questions ---
+    # First person narrative -> discussing a technique, not the prompt itself
+    not_prompt_starters = [
+        'i ', 'we ', 'my ', "i've ", "i'm ", 'been ', "i'd ",
+        # Third person narrative
+        'this ', 'the ', 'there ', 'it ', 'these ', 'those ',
+        'here ', 'so ', 'just ', 'new ',
+        # Questions
+        'has ', 'does ', 'can ', 'how ', 'what ', 'why ',
+        'is ', 'are ', 'did ', 'do ', 'would ', 'could ',
+        'anyone ', 'has anyone', 'does anyone',
+    ]
+    if any(tl.startswith(s) for s in not_prompt_starters):
+        return False
+
+    # --- IS a literal prompt ---
+    # Starts with imperative/second person directed at AI
+    prompt_starters = [
+        'you are ', 'you ', 'act as ', 'act ', 'ignore ', 'forget ',
+        'pretend ', 'from now on ', 'from ', 'do not ', 'generate ',
+        'write ', 'i want you to ', 'i need you to ',
+        'your task is ', 'you must ', 'you will ', 'you shall ',
+        'you should ', 'in this conversation ', 'for this conversation ',
+        'respond as ', 'reply as ', 'answer as ',
+        'simulate ', 'emulate ', 'mimic ',
+        'hello chatgpt', 'hi chatgpt', 'hey chatgpt',
+        'hello gpt', 'dear chatgpt',
+    ]
+    if any(tl.startswith(s) for s in prompt_starters):
+        return True
+
+    # System markers -> definitely a prompt
+    system_markers = ['[system]', '[inst]', '### system', '<<sys>>', '###', 'system:']
+    if any(tl.startswith(s) for s in system_markers):
+        return True
+
+    # Contains system/user/assistant markers (multi-turn format)
+    if '[system]' in tl or '[user]' in tl or '### instruction' in tl:
+        return True
+
+    # Text in code blocks or after prompt labels was already extracted;
+    # if we reach here and it has multi-paragraph imperative structure, keep it
+    if t.count('\n') >= 3 and any(kw in tl for kw in ['you are', 'act as', 'ignore', 'pretend', 'from now on']):
+        return True
+
+    return False
+
+
+# ===========================================================================
+# RULE 4: Language detection
+# ===========================================================================
+
+def detect_language(text):
+    """Simple language detection based on character ranges and common words."""
+    if not text or len(text) < 10:
+        return "unknown"
+
+    sample = text[:500].lower()
+
+    # Check character ranges
+    cjk_count = sum(1 for c in sample if '\u4e00' <= c <= '\u9fff')
+    cyrillic_count = sum(1 for c in sample if '\u0400' <= c <= '\u04ff')
+    arabic_count = sum(1 for c in sample if '\u0600' <= c <= '\u06ff')
+    hangul_count = sum(1 for c in sample if '\uac00' <= c <= '\ud7af')
+    devanagari_count = sum(1 for c in sample if '\u0900' <= c <= '\u097f')
+    thai_count = sum(1 for c in sample if '\u0e00' <= c <= '\u0e7f')
+    japanese_count = sum(1 for c in sample if '\u3040' <= c <= '\u30ff')
+
+    total_chars = len(sample)
+
+    if cjk_count / total_chars > 0.1:
+        if japanese_count > 0:
+            return "ja"
+        return "zh"
+    if cyrillic_count / total_chars > 0.1:
+        return "ru"
+    if arabic_count / total_chars > 0.1:
+        return "ar"
+    if hangul_count / total_chars > 0.1:
+        return "ko"
+    if devanagari_count / total_chars > 0.1:
+        return "hi"
+    if thai_count / total_chars > 0.1:
+        return "th"
+
+    # European language detection by common words
+    spanish_words = ['el ', 'la ', 'los ', 'las ', 'que ', 'del ', 'por ', 'para ', 'como ', 'esta ']
+    french_words = ['le ', 'la ', 'les ', 'des ', 'est ', 'que ', 'pour ', 'dans ', 'une ', 'avec ']
+    german_words = ['der ', 'die ', 'das ', 'und ', 'ist ', 'ein ', 'eine ', 'nicht ', 'mit ', 'auf ']
+    portuguese_words = ['que ', 'não ', 'para ', 'com ', 'uma ', 'por ', 'mais ', 'como ', 'seu ']
+    vietnamese_words = ['của ', 'và ', 'các ', 'cho ', 'một ', 'này ', 'trong ', 'được ', 'là ']
+
+    es_score = sum(1 for w in spanish_words if w in sample)
+    fr_score = sum(1 for w in french_words if w in sample)
+    de_score = sum(1 for w in german_words if w in sample)
+    pt_score = sum(1 for w in portuguese_words if w in sample)
+    vi_score = sum(1 for w in vietnamese_words if w in sample)
+
+    scores = {'es': es_score, 'fr': fr_score, 'de': de_score, 'pt': pt_score, 'vi': vi_score}
+    best = max(scores, key=scores.get)
+    if scores[best] >= 3:
+        return best
+
+    return "en"
+
+
 # ---------------------------------------------------------------------------
-# HARD KEEP signals — any one present in selftext => candidate for keep
+# HARD KEEP signals -- any one present in selftext => candidate for keep
 # ---------------------------------------------------------------------------
 
 JAILBREAK_PHRASES = [
@@ -172,7 +382,7 @@ RESEARCH_PHRASES = [
 ]
 
 # ---------------------------------------------------------------------------
-# HARD EXCLUDE signals — any one present => exclude (overrides KEEP)
+# HARD EXCLUDE signals -- any one present => exclude (overrides KEEP)
 # ---------------------------------------------------------------------------
 
 SEO_MARKETING_PHRASES = [
@@ -393,7 +603,7 @@ def classify_severity(taxonomy_category: str, selftext: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GATE FUNCTION
+# GATE FUNCTION (updated with Rule 1 integration)
 # ---------------------------------------------------------------------------
 
 def is_adversarial(selftext: str) -> bool:
@@ -401,6 +611,7 @@ def is_adversarial(selftext: str) -> bool:
     Returns True iff selftext passes the strict adversarial relevance gate.
 
     Hard EXCLUDE signals override hard KEEP signals.
+    Rule 1: Benign "act as" prompts are excluded.
     """
     if not selftext or not isinstance(selftext, str):
         return False
@@ -439,7 +650,7 @@ def is_adversarial(selftext: str) -> bool:
         return False
 
     # Auto-generated classifier descriptions that replaced real selftext in a
-    # previous pipeline run — these are NOT actual prompts.
+    # previous pipeline run -- these are NOT actual prompts.
     AUTO_DESCRIPTION_SIGNALS = [
         "unrelated to adversarial prompting",
         "not focused on adversarial prompting",
@@ -472,6 +683,16 @@ def is_adversarial(selftext: str) -> bool:
         )
         if not has_adversarial:
             return False
+
+    # ---- RULE 1: Benign "act as" filter ----
+    # If the text is an act-as prompt, only keep if adversarial signals present
+    act_as_result = is_adversarial_act_as(text)
+    if act_as_result is not None:
+        # This IS an act-as prompt
+        if act_as_result is False:
+            # Benign act-as prompt => EXCLUDE
+            return False
+        # act_as_result is True => adversarial act-as, fall through to KEEP
 
     # ---- HARD KEEP SIGNALS ----
 
@@ -522,7 +743,11 @@ def is_adversarial(selftext: str) -> bool:
 
 def main():
     print("=" * 65)
-    print("refilter_db.py — Strict Adversarial Relevance Gate")
+    print("refilter_db.py -- Strict Adversarial Relevance Gate (v3)")
+    print("  Rule 1: Exclude benign act-as prompts")
+    print("  Rule 2: Literal prompt detection for has_actual_prompt")
+    print("  Rule 3: Dedup by content hash only")
+    print("  Rule 4: Language detection")
     print("=" * 65)
     print()
 
@@ -535,25 +760,37 @@ def main():
         db = json.load(f)
 
     total_before = len(db)
+    old_relevant_count = sum(1 for e in db if e.get("relevant"))
+    old_has_prompt_count = sum(1 for e in db if e.get("has_actual_prompt"))
     print(f"Total entries before: {total_before:,}")
+    print(f"Relevant before:     {old_relevant_count:,}")
+    print(f"has_actual_prompt before: {old_has_prompt_count:,}")
     print()
 
     # Track examples for reporting
     newly_excluded = []   # was relevant=True, now relevant=False
-    correctly_kept = []   # relevant=True and still True
+    benign_act_as_excluded = []  # specifically excluded by Rule 1
+    correctly_kept = []   # relevant=True and still True with has_actual_prompt=True
+    lost_has_prompt = []  # had has_actual_prompt=True before, now False
 
     kept_count      = 0
     excluded_count  = 0
-
     reextracted_count = 0
+    lang_counts = Counter()
 
     for entry in db:
         selftext    = entry.get("selftext", "") or ""
         was_relevant = bool(entry.get("relevant"))
+        entry["_old_has_prompt"] = bool(entry.get("has_actual_prompt"))
         now_relevant = is_adversarial(selftext)
 
         # Update relevant field
         entry["relevant"] = now_relevant
+
+        # ---- Rule 4: Language detection ----
+        lang = detect_language(selftext)
+        entry["language"] = lang
+        lang_counts[lang] += 1
 
         if now_relevant:
             # Re-classify taxonomy and severity
@@ -561,6 +798,7 @@ def main():
             entry["taxonomy_category"] = new_cat
             entry["severity"]          = classify_severity(new_cat, selftext)
 
+            # ---- Rule 2: Literal prompt detection ----
             # Re-extract example_prompt if it is not null but looks truncated,
             # OR if it is null (try a fresh extraction).
             existing_prompt = entry.get("example_prompt")
@@ -570,8 +808,7 @@ def main():
                 if not new_prompt and selftext:
                     new_prompt = selftext.strip()[:5000]
                 if new_prompt and (existing_prompt is None or len(new_prompt) > len(existing_prompt)):
-                    entry["example_prompt"]    = new_prompt
-                    entry["has_actual_prompt"] = True
+                    entry["example_prompt"] = new_prompt
                     reextracted_count += 1
             else:
                 # Already have a prompt; ensure it is not capped at the old 600-char limit.
@@ -585,15 +822,32 @@ def main():
                         entry["example_prompt"] = new_prompt
                         reextracted_count += 1
 
+            # Rule 2: Set has_actual_prompt using is_literal_prompt
+            ep = entry.get("example_prompt") or ""
+            entry["has_actual_prompt"] = is_literal_prompt(ep)
+
             kept_count += 1
-            if len(correctly_kept) < 3:
+            if entry.get("has_actual_prompt") and len(correctly_kept) < 5:
                 correctly_kept.append(entry)
+            # Track entries that lost has_actual_prompt
+            old_had_prompt = bool(entry.get("_old_has_prompt"))
+            if old_had_prompt and not entry.get("has_actual_prompt"):
+                if len(lost_has_prompt) < 5:
+                    lost_has_prompt.append(entry)
         else:
             excluded_count += 1
-            if was_relevant and len(newly_excluded) < 3:
-                newly_excluded.append(entry)
+            if was_relevant:
+                if len(newly_excluded) < 5:
+                    newly_excluded.append(entry)
+                # Check if it was excluded specifically by Rule 1
+                act_as_check = is_adversarial_act_as(selftext)
+                if act_as_check is False and len(benign_act_as_excluded) < 5:
+                    benign_act_as_excluded.append(entry)
 
-    # ---- Save ----
+    # ---- Clean up temp fields and Save ----
+    for entry in db:
+        entry.pop("_old_has_prompt", None)
+
     print(f"Saving updated master_db.json...")
     with open(MASTER_DB_PATH, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2, ensure_ascii=False)
@@ -601,49 +855,113 @@ def main():
     size_bytes = os.path.getsize(MASTER_DB_PATH)
 
     # ---- Report ----
+    new_has_prompt_count = sum(1 for e in db if e.get("relevant") and e.get("has_actual_prompt"))
+
     print()
     print("=" * 65)
     print("RESULTS")
     print("=" * 65)
-    print(f"  Total entries (unchanged):  {total_before:,}")
-    print(f"  Relevant after filtering:   {kept_count:,}")
-    print(f"  Excluded after filtering:   {excluded_count:,}")
-    print(f"  Prompts re-extracted:       {reextracted_count:,}")
-    print(f"  DB file size:               {size_bytes:,} bytes ({size_bytes / 1024 / 1024:.1f} MB)")
+    print(f"  1. Total entries (unchanged):       {total_before:,}")
+    print(f"  2. Relevant after refilter:         {kept_count:,}  (was {old_relevant_count:,})")
+    print(f"  3. has_actual_prompt=True:           {new_has_prompt_count:,}  (was {old_has_prompt_count:,})")
+    print(f"     Prompts re-extracted:            {reextracted_count:,}")
+    print(f"     DB file size:                    {size_bytes:,} bytes ({size_bytes / 1024 / 1024:.1f} MB)")
+    print()
+
+    # 4. Language breakdown
+    print("  4. Language breakdown (all entries):")
+    for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
+        pct = count / total_before * 100 if total_before else 0
+        bar = "#" * min(40, count // max(1, total_before // 200))
+        print(f"     {lang:<6} {count:>6}  ({pct:5.1f}%)  {bar}")
     print()
 
     # Breakdown by taxonomy (relevant only)
     cat_counts = Counter(
         e["taxonomy_category"] for e in db if e.get("relevant")
     )
-    print("Breakdown by taxonomy_category (relevant only):")
+    print("  Breakdown by taxonomy_category (relevant only):")
     for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1]):
         bar = "#" * min(40, count // 20)
-        print(f"  {cat:<40} {count:>5}  {bar}")
+        print(f"    {cat:<40} {count:>5}  {bar}")
     print()
 
-    # Examples of newly excluded (were relevant, now not)
+    # 5a. Lost has_actual_prompt
+    lost_prompt_count = sum(
+        1 for e in db
+        if e.get("relevant") and not e.get("has_actual_prompt")
+    )
+    print(f"  5. Lost has_actual_prompt=True (descriptions, not literal prompts):")
+    print(f"     {old_has_prompt_count - new_has_prompt_count:,} entries lost has_actual_prompt=True")
+    if lost_has_prompt:
+        print(f"     Examples:")
+        for i, e in enumerate(lost_has_prompt[:5]):
+            ep_preview = (e.get('example_prompt') or '')[:120]
+            print(f"       [{i+1}] {(e.get('title') or '')[:60]}")
+            print(f"            prompt[:120]: {ep_preview!r}")
+    print()
+
+    # 6. Examples of entries that were REMOVED (benign "act as")
+    benign_act_as_count = sum(
+        1 for e in db
+        if not e.get("relevant") and is_adversarial_act_as(e.get("selftext", "")) is False
+    )
     print("=" * 65)
-    print("Examples of 3 entries that WERE relevant → NOW EXCLUDED (noise removal confirmed):")
+    print(f"  6. Benign 'act as' prompts excluded: {benign_act_as_count:,}")
+    print("     Examples of 5 entries REMOVED:")
     print("=" * 65)
-    for i, e in enumerate(newly_excluded):
+    if benign_act_as_excluded:
+        for i, e in enumerate(benign_act_as_excluded):
+            print(f"\n  [{i+1}] Title: {(e.get('title') or '')[:80]}")
+            print(f"       Category (old): {e.get('taxonomy_category', 'N/A')}")
+            print(f"       Selftext[:200]: {(e.get('selftext') or '')[:200]!r}")
+    else:
+        # Fall back to general newly_excluded
+        print("  (no benign act-as entries were previously relevant; showing general exclusions)")
+        for i, e in enumerate(newly_excluded):
+            print(f"\n  [{i+1}] Title: {(e.get('title') or '')[:80]}")
+            print(f"       Category (old): {e.get('taxonomy_category', 'N/A')}")
+            print(f"       Selftext[:200]: {(e.get('selftext') or '')[:200]!r}")
+
+    if not benign_act_as_excluded and not newly_excluded:
+        print("  (no entries newly excluded)")
+
+    # 7. Examples of entries that CHANGED from relevant to not-relevant
+    print()
+    print("=" * 65)
+    print(f"  7. Examples of 5 entries that CHANGED from relevant to NOT relevant:")
+    print("=" * 65)
+    for i, e in enumerate(newly_excluded[:5]):
         print(f"\n  [{i+1}] Title: {(e.get('title') or '')[:80]}")
         print(f"       Category (old): {e.get('taxonomy_category', 'N/A')}")
         print(f"       Selftext[:200]: {(e.get('selftext') or '')[:200]!r}")
-
     if not newly_excluded:
-        print("  (no entries newly excluded — all excluded entries were already marked non-relevant)")
+        print("  (none)")
 
-    # Examples of correctly kept
+    # 8. Examples of entries that KEPT relevant=True with has_actual_prompt=True
     print()
     print("=" * 65)
-    print("Examples of 3 entries CORRECTLY KEPT (adversarial content confirmed):")
+    print(f"  8. Examples of 5 entries CORRECTLY KEPT (relevant=True, has_actual_prompt=True):")
     print("=" * 65)
-    for i, e in enumerate(correctly_kept):
+    for i, e in enumerate(correctly_kept[:5]):
         print(f"\n  [{i+1}] Title: {(e.get('title') or '')[:80]}")
         print(f"       Category: {e.get('taxonomy_category', 'N/A')}")
         print(f"       Severity: {e.get('severity', 'N/A')}")
+        print(f"       Language: {e.get('language', 'N/A')}")
+        print(f"       has_actual_prompt: {e.get('has_actual_prompt', 'N/A')}")
         print(f"       Selftext[:200]: {(e.get('selftext') or '')[:200]!r}")
+
+    # 9. Language distribution of remaining relevant entries
+    print()
+    print("=" * 65)
+    print("  9. Language distribution of RELEVANT entries:")
+    print("=" * 65)
+    relevant_lang_counts = Counter(
+        e.get("language", "unknown") for e in db if e.get("relevant")
+    )
+    for lang, count in sorted(relevant_lang_counts.items(), key=lambda x: -x[1]):
+        pct = count / kept_count * 100 if kept_count else 0
+        print(f"     {lang:<6} {count:>6}  ({pct:5.1f}%)")
 
     print()
     print("Done.")

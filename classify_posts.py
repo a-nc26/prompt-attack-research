@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-classify_posts.py  –  Precision Classifier (v2)
+classify_posts.py  --  Precision Classifier (v3)
 ------------------------------------------------
 Takes a raw Reddit JSON file path as argument and runs 4-stage classification:
 
   STAGE 1: Strict Relevance Gate (KEEP / EXCLUDE indicators)
+           + Rule 1: Exclude benign "act as" prompts
   STAGE 2: Taxonomy (9 categories)
-  STAGE 3: Prompt Extraction
-  STAGE 4: Severity + Persona Role
+  STAGE 3: Prompt Extraction + Rule 2: Literal prompt detection
+  STAGE 4: Severity + Persona Role + Rule 4: Language detection
 
 Outputs:
   - master_db_v2.json  (appended, deduped, sorted newest-first)
@@ -33,8 +34,194 @@ DATE_STR       = datetime.now().strftime("%Y%m%d")
 TODAY_OUTPUT   = f"/tmp/reddit_classified_{DATE_STR}.json"
 
 
+# ===========================================================================
+# RULE 1: Adversarial "act as" detection
+# ===========================================================================
+
+_ACT_AS_PATTERN = re.compile(
+    r'(act as|you are|pretend to be|pretend you are|imagine you are|roleplay as|respond as|reply as|answer as)',
+    re.IGNORECASE,
+)
+
+RESTRICTION_REMOVAL_SIGNALS = [
+    "no restrictions", "no limits", "no boundaries", "no guidelines",
+    "without restrictions", "without limits", "without filters",
+    "without guidelines", "bypass", "unrestricted", "unfiltered",
+    "uncensored", "unaligned", "no safety", "remove safety",
+    "disable safety", "safety off", "guardrails off", "no guardrails",
+]
+
+UNETHICAL_SIGNALS = [
+    "unethical", "amoral", "immoral", "no morals", "no ethics",
+    "evil", "harmful", "dangerous", "illegal", "malicious",
+    "nefarious", "sinister",
+]
+
+KNOWN_JAILBREAK_PERSONAS = [
+    "DAN", "STAN", "DUDE", "AIM", "JAILBREAK", "ENI", "LIME", "Neptune",
+    "Lyra", "MAX", "Developer Mode", "Sigma", "APOPHIS", "AntiGPT",
+    "BetterDAN", "KEVIN", "JailBreak", "BasedGPT", "UnGPT", "OMEGA",
+]
+
+_PERSONA_WORD_PATTERNS = [
+    re.compile(r'\b' + re.escape(name) + r'\b', re.IGNORECASE)
+    for name in KNOWN_JAILBREAK_PERSONAS
+]
+
+INSTRUCTION_OVERRIDE_SIGNALS = [
+    "ignore previous", "ignore all", "forget your training",
+    "forget your instructions", "disregard your", "override your",
+    "new instructions", "supersede", "overwrite your programming",
+    "ignore your programming",
+]
+
+
+def is_adversarial_act_as(text: str) -> bool:
+    """
+    Rule 1: Return True if text contains an "act as" / "you are" / "pretend"
+    pattern AND at least one adversarial signal. Return False if the prompt
+    is benign (no adversarial signals).
+
+    If the text does NOT contain any act-as pattern at all, return None
+    (meaning this rule does not apply and other rules should decide).
+    """
+    if not text:
+        return None
+
+    if not _ACT_AS_PATTERN.search(text):
+        return None
+
+    low = text.lower()
+
+    if any(sig in low for sig in RESTRICTION_REMOVAL_SIGNALS):
+        return True
+    if any(sig in low for sig in UNETHICAL_SIGNALS):
+        return True
+    for pat in _PERSONA_WORD_PATTERNS:
+        if pat.search(text):
+            return True
+    if any(sig in low for sig in INSTRUCTION_OVERRIDE_SIGNALS):
+        return True
+
+    return False
+
+
+# ===========================================================================
+# RULE 2: Literal prompt detection
+# ===========================================================================
+
+def is_literal_prompt(text):
+    """
+    Return True only if text looks like a literal copy-paste prompt that you
+    could paste into ChatGPT/Claude. Discussions, blog posts, academic
+    descriptions, and questions are NOT literal prompts.
+    """
+    if not text or len(text) < 20:
+        return False
+    t = text.strip()
+    tl = t.lower()
+
+    # --- NOT a literal prompt: natural prose / discussion / questions ---
+    not_prompt_starters = [
+        'i ', 'we ', 'my ', "i've ", "i'm ", 'been ', "i'd ",
+        'this ', 'the ', 'there ', 'it ', 'these ', 'those ',
+        'here ', 'so ', 'just ', 'new ',
+        'has ', 'does ', 'can ', 'how ', 'what ', 'why ',
+        'is ', 'are ', 'did ', 'do ', 'would ', 'could ',
+        'anyone ', 'has anyone', 'does anyone',
+    ]
+    if any(tl.startswith(s) for s in not_prompt_starters):
+        return False
+
+    # --- IS a literal prompt ---
+    prompt_starters = [
+        'you are ', 'you ', 'act as ', 'act ', 'ignore ', 'forget ',
+        'pretend ', 'from now on ', 'from ', 'do not ', 'generate ',
+        'write ', 'i want you to ', 'i need you to ',
+        'your task is ', 'you must ', 'you will ', 'you shall ',
+        'you should ', 'in this conversation ', 'for this conversation ',
+        'respond as ', 'reply as ', 'answer as ',
+        'simulate ', 'emulate ', 'mimic ',
+        'hello chatgpt', 'hi chatgpt', 'hey chatgpt',
+        'hello gpt', 'dear chatgpt',
+    ]
+    if any(tl.startswith(s) for s in prompt_starters):
+        return True
+
+    # System markers
+    system_markers = ['[system]', '[inst]', '### system', '<<sys>>', '###', 'system:']
+    if any(tl.startswith(s) for s in system_markers):
+        return True
+
+    if '[system]' in tl or '[user]' in tl or '### instruction' in tl:
+        return True
+
+    if t.count('\n') >= 3 and any(kw in tl for kw in ['you are', 'act as', 'ignore', 'pretend', 'from now on']):
+        return True
+
+    return False
+
+
+# ===========================================================================
+# RULE 4: Language detection
+# ===========================================================================
+
+def detect_language(text):
+    """Simple language detection based on character ranges and common words."""
+    if not text or len(text) < 10:
+        return "unknown"
+
+    sample = text[:500].lower()
+
+    # Check character ranges
+    cjk_count = sum(1 for c in sample if '\u4e00' <= c <= '\u9fff')
+    cyrillic_count = sum(1 for c in sample if '\u0400' <= c <= '\u04ff')
+    arabic_count = sum(1 for c in sample if '\u0600' <= c <= '\u06ff')
+    hangul_count = sum(1 for c in sample if '\uac00' <= c <= '\ud7af')
+    devanagari_count = sum(1 for c in sample if '\u0900' <= c <= '\u097f')
+    thai_count = sum(1 for c in sample if '\u0e00' <= c <= '\u0e7f')
+    japanese_count = sum(1 for c in sample if '\u3040' <= c <= '\u30ff')
+
+    total_chars = len(sample)
+
+    if cjk_count / total_chars > 0.1:
+        if japanese_count > 0:
+            return "ja"
+        return "zh"
+    if cyrillic_count / total_chars > 0.1:
+        return "ru"
+    if arabic_count / total_chars > 0.1:
+        return "ar"
+    if hangul_count / total_chars > 0.1:
+        return "ko"
+    if devanagari_count / total_chars > 0.1:
+        return "hi"
+    if thai_count / total_chars > 0.1:
+        return "th"
+
+    # European language detection by common words
+    spanish_words = ['el ', 'la ', 'los ', 'las ', 'que ', 'del ', 'por ', 'para ', 'como ', 'esta ']
+    french_words = ['le ', 'la ', 'les ', 'des ', 'est ', 'que ', 'pour ', 'dans ', 'une ', 'avec ']
+    german_words = ['der ', 'die ', 'das ', 'und ', 'ist ', 'ein ', 'eine ', 'nicht ', 'mit ', 'auf ']
+    portuguese_words = ['que ', 'não ', 'para ', 'com ', 'uma ', 'por ', 'mais ', 'como ', 'seu ']
+    vietnamese_words = ['của ', 'và ', 'các ', 'cho ', 'một ', 'này ', 'trong ', 'được ', 'là ']
+
+    es_score = sum(1 for w in spanish_words if w in sample)
+    fr_score = sum(1 for w in french_words if w in sample)
+    de_score = sum(1 for w in german_words if w in sample)
+    pt_score = sum(1 for w in portuguese_words if w in sample)
+    vi_score = sum(1 for w in vietnamese_words if w in sample)
+
+    scores = {'es': es_score, 'fr': fr_score, 'de': de_score, 'pt': pt_score, 'vi': vi_score}
+    best = max(scores, key=scores.get)
+    if scores[best] >= 3:
+        return best
+
+    return "en"
+
+
 # ---------------------------------------------------------------------------
-# STAGE 1 helpers – Strict Relevance Gate
+# STAGE 1 helpers -- Strict Relevance Gate
 # ---------------------------------------------------------------------------
 
 KEEP_INDICATORS = {
@@ -125,6 +312,7 @@ EXCLUDE_INDICATORS = {
 def passes_relevance_gate(title: str, selftext: str) -> bool:
     """STAGE 1: Return True only if the post passes the strict relevance gate."""
     combined_lower = (title + " " + selftext).lower()
+    combined_text  = title + " " + selftext
 
     # --- Check EXCLUDE indicators first ---
     for group_indicators in EXCLUDE_INDICATORS.values():
@@ -136,6 +324,12 @@ def passes_relevance_gate(title: str, selftext: str) -> bool:
                         return False
                 else:
                     return False
+
+    # --- Rule 1: Benign "act as" filter ---
+    act_as_result = is_adversarial_act_as(combined_text)
+    if act_as_result is not None:
+        if act_as_result is False:
+            return False  # Benign act-as prompt => EXCLUDE
 
     # --- Check KEEP indicators ---
     for indicator in KEEP_INDICATORS["prompt_patterns"]:
@@ -439,13 +633,14 @@ def process_post(raw: dict) -> dict:
     if taxonomy_category == "Other/Unclassified":
         relevant = False
 
-    # Stage 3 – Prompt extraction
+    # Stage 3 – Prompt extraction + Rule 2: literal prompt detection
     example_prompt   = extract_prompt(selftext)
-    has_actual_prompt = bool(example_prompt and len(example_prompt.strip()) > 10)
+    has_actual_prompt = is_literal_prompt(example_prompt) if example_prompt else False
 
-    # Stage 4 – Severity + persona
+    # Stage 4 – Severity + persona + Rule 4: language detection
     severity    = compute_severity(taxonomy_category, has_actual_prompt, base_severity)
     persona_role = extract_persona(title + " " + selftext)
+    language    = detect_language(selftext)
 
     # Technique name / description
     technique_name, technique_description = derive_technique(title, taxonomy_category)
@@ -483,6 +678,7 @@ def process_post(raw: dict) -> dict:
         "persona_role":        persona_role,
         "severity":            severity,
         "has_actual_prompt":   has_actual_prompt,
+        "language":            language,
         "classified_at":       datetime.now(tz=timezone.utc).isoformat(),
     }
 
@@ -557,6 +753,26 @@ def main():
 
     with open(TODAY_OUTPUT, "w", encoding="utf-8") as f:
         json.dump(new_posts, f, indent=2, ensure_ascii=False)
+
+    # Also merge new posts into master_db.json (the canonical DB the dashboard reads)
+    MAIN_DB_PATH = os.path.join(DATA_DIR, "master_db.json")
+    if os.path.exists(MAIN_DB_PATH):
+        with open(MAIN_DB_PATH, "r", encoding="utf-8") as f:
+            try:
+                main_db = json.load(f)
+            except json.JSONDecodeError:
+                main_db = []
+        main_permalinks = set(p.get("permalink", "") for p in main_db)
+        main_ids = set(p.get("id", "") for p in main_db)
+        added_to_main = 0
+        for p in new_posts:
+            pid = p.get("permalink", "") or p.get("id", "")
+            if pid not in main_permalinks and p.get("id", "") not in main_ids:
+                main_db.append(p)
+                added_to_main += 1
+        with open(MAIN_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(main_db, f, indent=2, ensure_ascii=False)
+        print(f"  Added to main DB:    {added_to_main} (total: {len(main_db)})")
 
     # --- Summary ---
     print(f"\n--- Classification Summary ---")
