@@ -126,6 +126,25 @@ def build_html(all_posts: list) -> str:
         f'<option value="{attr_val(s)}">{esc(s)}</option>' for s in severities
     )
 
+    # Technique dropdown: only technique names appearing 2+ times, sorted by frequency
+    tech_counts = Counter(p.get("technique_name", "") for p in posts if p.get("technique_name"))
+    tech_options = [(name, cnt) for name, cnt in tech_counts.most_common() if cnt >= 2 and name]
+    tech_options_html = "\n".join(
+        f'<option value="{attr_val(name)}">{esc(name)} ({cnt})</option>'
+        for name, cnt in tech_options
+    )
+
+    # Language dropdown: only languages that exist in the data, sorted by frequency
+    lang_counts = Counter(p.get("language", "") for p in posts if p.get("language"))
+    lang_labels = {"en": "English", "fr": "French", "zh": "Chinese", "es": "Spanish",
+                   "de": "German", "pt": "Portuguese", "ja": "Japanese", "ko": "Korean",
+                   "ru": "Russian", "ar": "Arabic", "it": "Italian", "nl": "Dutch"}
+    lang_options = [(code, cnt) for code, cnt in lang_counts.most_common() if code]
+    lang_options_html = "\n".join(
+        f'<option value="{attr_val(code)}">{esc(lang_labels.get(code, code))} ({cnt})</option>'
+        for code, cnt in lang_options
+    )
+
     # Sidebar items (data-cat avoids HTML-entity-encoding issues in onclick)
     sidebar_items_html = (
         '<div class="sidebar-item sidebar-all" data-cat="">'
@@ -144,6 +163,12 @@ def build_html(all_posts: list) -> str:
     # Build JS data array (only relevant posts)
     js_rows = []
     for p in posts:
+        # Fix dates: use created_utc if available, otherwise leave empty
+        if p.get('created_utc', 0) and int(p.get('created_utc', 0)) > 0:
+            post_date = datetime.fromtimestamp(int(p['created_utc']), tz=timezone.utc).strftime('%Y-%m-%d')
+        else:
+            post_date = p.get("post_date", "") or ""
+
         js_rows.append({
             "id":                   p.get("id", "") or "",
             "title":                p.get("title", "") or "",
@@ -151,7 +176,7 @@ def build_html(all_posts: list) -> str:
             "author":               p.get("author", "") or "",
             "subreddit":            p.get("subreddit", "") or "",
             "permalink":            p.get("permalink", "") or "",
-            "post_date":            p.get("post_date", "") or "",
+            "post_date":            post_date,
             "score":                int(p.get("score", 0) or 0),
             "num_comments":         int(p.get("num_comments", 0) or 0),
             "taxonomy_category":    p.get("taxonomy_category", "Other/Unclassified") or "Other/Unclassified",
@@ -161,6 +186,7 @@ def build_html(all_posts: list) -> str:
             "severity":             p.get("severity", "Info") or "Info",
             "has_actual_prompt":    bool(p.get("has_actual_prompt")),
             "example_prompt":       p.get("example_prompt") or None,
+            "language":             p.get("language", "") or "",
         })
 
     js_data_json   = json.dumps(js_rows, ensure_ascii=True)
@@ -539,6 +565,20 @@ def build_html(all_posts: list) -> str:
         <option value="">All Severities</option>
         {sev_options_html}
       </select>
+      <select id="sourceFilter" onchange="applyFilters()">
+        <option value="">All Sources</option>
+        <option value="HuggingFace">HuggingFace</option>
+        <option value="GitHub">GitHub</option>
+        <option value="Reddit">Reddit</option>
+      </select>
+      <select id="techFilter" onchange="applyFilters()">
+        <option value="">All Techniques</option>
+        {tech_options_html}
+      </select>
+      <select id="langFilter" onchange="applyFilters()">
+        <option value="">All Languages</option>
+        {lang_options_html}
+      </select>
       <button class="btn" id="promptToggleBtn" onclick="toggleHasPrompt()">Has Prompt</button>
       <button class="btn" onclick="clearAllFilters()">Clear Filters</button>
       <span class="result-count" id="resultCount"></span>
@@ -669,9 +709,11 @@ function renderRow(p) {{
     + '<span class="ext-icon"> &#8599;</span></a>'
     : '<span class="sub-badge">r/' + escHtml(p.subreddit) + '</span>';
 
-  // Col 8: Date
+  // Col 8: Date — show dash for entries without dates
   const dateStr  = (p.post_date || '').slice(0, 10);
-  const dateHtml = '<span class="date-cell">' + escHtml(dateStr) + '</span>';
+  const dateHtml = dateStr
+    ? '<span class="date-cell">' + escHtml(dateStr) + '</span>'
+    : '<span class="no-date" style="color:#555">\u2014</span>';
 
   return '<tr>'
     + '<td>' + sevHtml + '</td>'
@@ -686,15 +728,20 @@ function renderRow(p) {{
 }}
 
 function getFiltered() {{
-  const search = (document.getElementById('searchBox').value || '').toLowerCase();
-  const catF   = document.getElementById('catFilter').value;
-  const sevF   = document.getElementById('sevFilter').value;
+  const search       = (document.getElementById('searchBox').value || '').toLowerCase();
+  const catF         = document.getElementById('catFilter').value;
+  const sevF         = document.getElementById('sevFilter').value;
+  const sourceFilter = document.getElementById('sourceFilter').value;
+  const techFilter   = document.getElementById('techFilter').value;
+  const langFilter   = document.getElementById('langFilter').value;
 
-  return DATA.filter(function(p) {{
+  let filtered = DATA.filter(function(p) {{
     if (activeCategory !== null && p.taxonomy_category !== activeCategory) return false;
     if (catF && p.taxonomy_category !== catF) return false;
     if (sevF && p.severity !== sevF) return false;
     if (showHasPromptOnly && p.has_actual_prompt !== true) return false;
+    if (techFilter && p.technique_name !== techFilter) return false;
+    if (langFilter && p.language !== langFilter) return false;
     if (search) {{
       const hay = [
         p.technique_name        || '',
@@ -703,17 +750,37 @@ function getFiltered() {{
         p.title                 || '',
         p.taxonomy_category     || '',
         p.persona_role          || '',
+        p.subreddit             || '',
       ].join(' ').toLowerCase();
       if (!hay.includes(search)) return false;
     }}
     return true;
   }});
+
+  // Source filter (grouped categories)
+  if (sourceFilter === 'HuggingFace') {{
+    filtered = filtered.filter(function(p) {{ return p.subreddit.toLowerCase() === 'huggingface'; }});
+  }} else if (sourceFilter === 'GitHub') {{
+    filtered = filtered.filter(function(p) {{ return p.subreddit === 'GitHub'; }});
+  }} else if (sourceFilter === 'Reddit') {{
+    filtered = filtered.filter(function(p) {{ return p.subreddit !== 'HuggingFace' && p.subreddit.toLowerCase() !== 'huggingface' && p.subreddit !== 'GitHub'; }});
+  }}
+
+  return filtered;
 }}
 
 function getSorted(data) {{
   return data.slice().sort(function(a, b) {{
     var av = a[sortCol];
     var bv = b[sortCol];
+    // For date column: empty dates always sort to the bottom
+    if (sortCol === 'post_date') {{
+      var aEmpty = !av || av === '';
+      var bEmpty = !bv || bv === '';
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1;   // a has no date -> goes last
+      if (bEmpty) return -1;  // b has no date -> goes last
+    }}
     if (av == null && bv == null) return 0;
     if (av == null) return 1;
     if (bv == null) return -1;
@@ -807,6 +874,9 @@ function clearAllFilters() {{
   document.getElementById('searchBox').value = '';
   document.getElementById('catFilter').value = '';
   document.getElementById('sevFilter').value = '';
+  document.getElementById('sourceFilter').value = '';
+  document.getElementById('techFilter').value = '';
+  document.getElementById('langFilter').value = '';
   activeCategory = null;
   showHasPromptOnly = false;
   currentPage = 1;
